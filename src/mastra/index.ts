@@ -2,7 +2,7 @@ import { createLogger } from "@mastra/core/logger";
 import { Mastra } from "@mastra/core/mastra";
 import { PgVector } from "@mastra/pg";
 import dotenv from "dotenv";
-import { realEstateAgent } from "./agents";
+import { realEstateAgent, sqlAgent } from "./agents";
 // Knowledge ingestion should be run as a separate script before starting the app
 // import { ingestKnowledge } from "./config/knowledge";
 dotenv.config();
@@ -13,7 +13,7 @@ const knowledgeVectorStore = new PgVector({
 });
 
 export const mastra = new Mastra({
-	agents: { realEstateAgent },
+	agents: { realEstateAgent, sqlAgent },
 	vectors: {
 		general_knowledge: knowledgeVectorStore,
 	},
