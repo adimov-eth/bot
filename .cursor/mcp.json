@@ -1,0 +1,21 @@
+{
+	"mcpServers": {
+		"mastra": {
+			"command": "npx",
+			"args": ["-y", "@mastra/mcp-docs-server@latest"]
+		},
+		"github.com/cloudflare/mcp-server-cloudflare": {
+			"command": "npx",
+			"args": [
+				"mcp-remote",
+				"https://mcp.cloudflare.com/workers/observability/sse"
+			],
+			"disabled": false,
+			"autoApprove": ["worker_list"],
+			"management": {
+				"type": "on-demand",
+				"pidFile": "/Users/adimov/.mcp-manager/github_com_cloudflare_mcp_server_cloudflare.pid"
+			}
+		}
+	}
+}

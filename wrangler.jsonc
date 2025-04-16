@@ -9,7 +9,30 @@
 	"compatibility_date": "2025-04-16",
 	"observability": {
 		"enabled": true
-	}
+	},
+	"kv_namespaces": [
+		{
+			"binding": "MASTRA_WORKER_THREADS",
+			"id": "fe8957771cd7492a98853f456d468e8a"
+		},
+		{
+			"binding": "MASTRA_WORKER_MESSAGES",
+			"id": "ce9f466f930847228020d5ad744dfce2"
+		},
+		{
+			"binding": "MASTRA_WORKER_WORKFLOWS",
+			"id": "488161ad7e49445e88c0772f8fabbc66"
+		},
+		{
+			"binding": "MASTRA_WORKER_EVALS",
+			"id": "0bee75bfa2c2467d8d8ec39b4e1fb1ba"
+		},
+		{
+			"binding": "MASTRA_WORKER_TRACES",
+			"id": "5952fb0cd6fa403bbadd3e8e101fa288"
+		}
+	]
+
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
