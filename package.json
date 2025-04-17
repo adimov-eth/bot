@@ -36,6 +36,7 @@
 		"ai": "^4.3.8",
 		"cloudflare": "^4.2.0",
 		"mastra": "^0.4.9",
+		"node-telegram-bot-api": "^0.66.0",
 		"pg": "^8.14.1",
 		"zod": "^3.24.2"
 	}

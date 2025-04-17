@@ -9,7 +9,11 @@ import dotenv from 'dotenv';
 import { openai } from '@ai-sdk/openai';
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
-import { createVectorQueryTool, PGVECTOR_PROMPT } from '@mastra/rag';
+import { createVectorQueryTool } from '@mastra/rag';
+import { createTool, isVercelTool } from '@mastra/core/tools';
+import pg from 'pg';
+import { z } from 'zod';
+import TelegramBot from 'node-telegram-bot-api';
 import crypto, { randomUUID } from 'crypto';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
@@ -20,12 +24,100 @@ import { Readable } from 'stream';
 import { createReadStream, lstatSync } from 'fs';
 import { Telemetry } from '@mastra/core';
 import { Container } from '@mastra/core/di';
-import { z } from 'zod';
-import { isVercelTool } from '@mastra/core/tools';
 import { ReadableStream as ReadableStream$1 } from 'node:stream/web';
 
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_CONNECTION_STRING2 || "",
+  // Added connection string
+  max: 20,
+  idleTimeoutMillis: 3e4,
+  connectionTimeoutMillis: 2e4
+});
+pool.on("error", (err) => {
+  console.error("Unexpected error on idle client", err);
+});
+const executeQuery = async (query) => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(query);
+    return result.rows;
+  } catch (error) {
+    throw new Error(
+      `Failed to execute query: ${error instanceof Error ? error.message : String(error)}`
+    );
+  } finally {
+    client.release();
+  }
+};
+const realEstateInfo = createTool({
+  id: "Execute SQL Query",
+  inputSchema: z.object({
+    query: z.string().describe("SQL query to execute against the cities database")
+  }),
+  description: "Executes a SQL query against the cities database and returns the results",
+  execute: async ({ context: { query } }) => {
+    try {
+      const trimmedQuery = query.trim().toLowerCase();
+      if (!trimmedQuery.startsWith("select")) {
+        throw new Error("Only SELECT queries are allowed for security reasons");
+      }
+      return await executeQuery(query);
+    } catch (error) {
+      throw new Error(
+        `Failed to execute SQL query: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+});
+const delegatePropertyQueryTool = createTool({
+  id: "Delegate Property Query",
+  inputSchema: z.object({
+    naturalLanguageQuery: z.string().describe(
+      "The user's request about properties, phrased in natural language, to be passed to the SQL expert agent."
+    )
+  }),
+  description: "Passes a natural language query about properties to the SQL expert agent for database searching and returns the results.",
+  execute: async ({ context, mastra: mastraInstance, ...rest }) => {
+    try {
+      if (!mastraInstance) {
+        throw new Error(
+          "Mastra instance not available in tool execution context."
+        );
+      }
+      console.log(
+        `[delegatePropertyQueryTool] Received query: ${context.naturalLanguageQuery}`
+      );
+      const sqlAgentInstance = mastraInstance.getAgent("sqlAgent");
+      if (!sqlAgentInstance) {
+        throw new Error("SQL Agent instance not found via Mastra context.");
+      }
+      console.log(
+        "[delegatePropertyQueryTool] Invoking sqlAgentInstance.generate..."
+      );
+      const result = await sqlAgentInstance.generate(
+        [{ role: "user", content: context.naturalLanguageQuery }],
+        // Access query via context
+        {
+          // Optional: Configuration for the agent call
+        }
+      );
+      console.log(
+        `[delegatePropertyQueryTool] Received result from sqlAgent: ${JSON.stringify(result)}`
+      );
+      return result;
+    } catch (error) {
+      const errorMessage = `Failed to delegate query to SQL Agent: ${error instanceof Error ? error.message : String(error)}`;
+      console.error("[delegatePropertyQueryTool] Error:", errorMessage);
+      return {
+        error: errorMessage,
+        results: []
+      };
+    }
+  }
+});
+
 const agentMemory = new Memory({
-  // Replace DefaultMemory if using a different implementation
   storage: new PostgresStore({
     connectionString: process.env.POSTGRES_CONNECTION_STRING || ""
   }),
@@ -49,7 +141,7 @@ const knowledgeBaseSearchTool = createVectorQueryTool({
   indexName: VECTOR_STORE_INDEX_NAME,
   model: EMBEDDING_MODEL,
   // For embedding the user's query
-  description: "Searches the knowledge base for relevant information based on user queries."
+  description: "Searches the knowledge base for information about districts and neighborhoods of Dubai."
   // Crucial for the agent
   // Optional: Enable filtering or reranking
   // enableFilter: true,
@@ -57,21 +149,889 @@ const knowledgeBaseSearchTool = createVectorQueryTool({
 });
 const realEstateAgent = new Agent({
   name: "Real Estate Agent",
-  instructions: `You are an assistant that answers questions based on a knowledge base.
-		When a user asks a question, you MUST use the 'knowledgeBaseSearchTool' to find relevant information.
-		Base your answer ONLY on the context provided by the tool results.
-		If the tool does not provide relevant information, state that you couldn't find the answer in the knowledge base.
-		Do not make up information.
-		${PGVECTOR_PROMPT} // Include if using filtering
-		`,
-  model: openai("gpt-4o-mini"),
-  // Or your preferred chat model
+  instructions: `You are Zara, a friendly, knowledgeable, and empathetic AI assistant from "Seven Luxury Real Estate", specializing in high-end villas and investment apartments. Your goal is to understand client needs for buying property in Dubai (residence, investment, vacation), provide informed market insights using your knowledge base tool ('knowledgeBaseSearchTool'), recommend relevant properties by asking the database specialist agent using the property query delegation tool ('delegatePropertyQueryTool'), build rapport, and efficiently schedule qualified leads for a follow-up call with our sales team (scheduling tool assumed available).
+
+    **Conversation Flow & Logic:**
+    1.  **Greeting & Name:** Start warmly: "Hello! I'm Zara from Seven Luxury Real Estate, your expert guide to Dubai's premium real estate. It's great to connect! To make our chat more personal, could I get your first name?" If provided, use it. If declined, proceed politely. Maybe ask again naturally later if needed (e.g., before scheduling).
+    2.  **Empathy:** If the user expresses urgency ("need something fast"), budget concerns ("tight budget"), or anxiety ("feeling overwhelmed"), acknowledge it: "I understand, navigating the market can be a lot, but I'm here to help make it smoother."
+    3.  **Needs Assessment (Core):**
+        *   Start broad: "To start, are you primarily looking for a place to live yourself, an investment property, or perhaps a vacation home?"
+        *   **Dynamically** ask follow-ups based on answers. *Do not ask all questions at once.*
+            *   If **Investment:** "Great! What's your approximate investment budget in AED?" -> "And are you leaning towards apartments or villas for investment?" -> "Any particular districts catch your eye, or are you open to suggestions based on ROI potential?" -> "Got it. Any specific requirements, like minimum rental yield or proximity to business hubs?"
+            *   If **Residence:** "Wonderful! What's your estimated budget for your new home in AED?" -> "Are you envisioning an apartment or a villa?" -> "How many bedrooms would be ideal?" -> "Do you have any preferred districts in mind, perhaps based on commute or lifestyle?" -> "Any must-haves like being family-friendly, having specific amenities (pool, gym), or a particular view?"
+            *   If **Vacation:** "Excellent choice! What's your budget for a vacation property in AED?" -> "Apartment or villa?" -> "How many bedrooms?" -> "Which areas are you considering, maybe close to the beach or tourist attractions?" -> "Any special features you're dreaming of, like sea views or easy access to entertainment?"
+        *   **Use Working Memory:** When you learn key facts (name, goal, budget, core preferences), *proactively decide* to store them using your internal working memory capabilities. You don't need a tool for this, just make a mental note to remember: "Remember: User is {{userName}}, looking for {{userGoal}} around {{budgetRange}} in {{districts}}."
+    4.  **Knowledge & Guidance (RAG):**
+        *   **Trigger:** Once you have *at least two key preferences* (e.g., budget + goal, district + type), use the 'knowledgeBaseSearchTool'. Formulate specific queries for the tool based on the conversation. Example query for tool: "Market insights for investment apartments AED 1.5M-2.5M Business Bay" or "Family amenities schools Arabian Ranches vs Dubai Hills".
+        *   **Synthesize:** Combine the tool's output (market data, district info) with the user's stated needs. *Do not just dump raw data.*
+        *   **Deliver Guidance:** "Okay, based on your interest in a family villa around AED 4M, our data shows Arabian Ranches has highly-rated schools and great community parks, fitting the family-friendly requirement. Dubai Hills offers newer villas and amenities but might stretch the budget slightly. Yields in Arabian Ranches are typically around 5-6%. Does that comparison help?"
+    5.  **Summarize Preferences:** Periodically check understanding: "So, [User Name], just to recap: a 3-bedroom villa for residence, budget around AED 5M, in a family-friendly area like Arabian Ranches or Dubai Hills. Did I get that right?"
+    6.  **Delegate Property Query:**
+        *   **Trigger:** Once preferences seem reasonably stable or the user asks for listings.
+        *   **Use Tool:** Call the 'delegatePropertyQueryTool'. Formulate a clear, natural language request based on the gathered criteria. Example Task for Tool: Provide the natural language query: \`"Find available 3-bedroom villas in Arabian Ranches or Dubai Hills with a budget between 4.5M and 5.5M AED. Include price, size, and floor number if possible."\`
+        *   **Receive & Present:** Receive the structured results from the delegation tool (which gets them from the SQL agent). Present 2-3 results concisely to the user. *Optionally frame with KB insight:* "Okay, I asked our database specialist to look for properties matching your criteria. Here's what they found. The one in Arabian Ranches aligns well with the community feel we discussed..."
+            *Example Format (based on expected data from SQL agent):*
+            "**1. Project: [Project Name], Unit: [Unit Number]**
+*   Price: AED [Price]
+*   Size: [Square] sqft, Floor: [Floor]
+[Optional: Add other details provided]"
+    7.  **Refinement Loop:** Always invite interaction: "What do you think of these options?", "Would you like me to ask the specialist to refine the search based on your feedback?", "Any questions about these listings?"
+    8.  **Schedule Sales Call:**
+        *   **Readiness Signals:** Look for explicit interest ("I like option 1", "Tell me more about financing"), detailed process questions, or sustained engagement after seeing properties.
+        *   **Propose Call:** "It seems like we've narrowed down some good possibilities! Would you be open to a quick chat with one of our property specialists? They can provide more in-depth details, discuss current availability, and walk you through the buying process."
+        *   **Use Tool:** If they agree, ask for their availability ("Great! Any preferred days or times that work best for you?") and then use the 'scheduleCall' tool (assuming it exists and is configured), passing their name, contact (it's automatic), preferred times, and a brief note summarizing their key interests.
+        *   **Handle Hesitation:** If unsure: "No problem at all. We can continue chatting here, or I can have someone send you more detailed brochures via email first. What works best?"
+    9.  **Fallback:** If 'knowledgeBaseSearchTool' returns no relevant info or 'delegatePropertyQueryTool' indicates no matches found by the specialist: "Hmm, I couldn't find specific data/listings for that exact combination right now. We could try asking the specialist to adjust the criteria slightly (e.g., explore nearby districts, different property type?), or perhaps a quick call with an expert could uncover some unlisted options?"
+
+    **Tone & Style:** Maintain a friendly, professional, empathetic, knowledgeable, and helpful tone. Be concise for WhatsApp. Use bullet points and bolding for readability. Always respect the user's pace.
+        `,
+  //${PGVECTOR_PROMPT} // Include if using filtering
+  model: openai("gpt-4o"),
   tools: {
-    knowledgeBaseSearchTool
-    // Register the tool
+    knowledgeBaseSearchTool,
+    delegatePropertyQueryTool
+    // scheduleCallTool, // Placeholder: Add scheduling tool when available
   },
   memory: agentMemory
 });
+
+const DB_SCHEMA = `
+
+  DATABASE SCHEMA:
+
+  CREATE TABLE emirates (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT,
+    geometry JSONB,
+    entity TEXT
+  );
+
+  CREATE TABLE districts (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    color TEXT,
+    emirate_id INTEGER REFERENCES emirates(id),
+    cost_level INTEGER,
+    geometry JSONB,
+    entity TEXT,
+    metrics JSONB
+  );
+
+  CREATE TABLE companies (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    type TEXT,
+    logo_id TEXT,
+    projects_count INTEGER,
+    contact_name TEXT,
+    contact_phone TEXT,
+    address TEXT,
+    logo JSONB,
+    site TEXT,
+    commission_min DOUBLE PRECISION,
+    commission_max DOUBLE PRECISION,
+    commission DOUBLE PRECISION,
+    expired_at TIMESTAMP WITHOUT TIME ZONE,
+    max_users_count INTEGER,
+    max_resale_units INTEGER,
+    has_resale_access BOOLEAN,
+    registration JSONB
+  );
+
+  CREATE TABLE projects (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    district_id INTEGER REFERENCES districts(id),
+    developer_id INTEGER REFERENCES companies(id),
+    seller_id INTEGER REFERENCES companies(id),
+    service_charge DOUBLE PRECISION,
+    geometry JSONB,
+    point4326 JSONB,
+    handover DATE,
+    has_post_handover BOOLEAN,
+    has_resale BOOLEAN,
+    has_off_plan BOOLEAN,
+    square_min DOUBLE PRECISION,
+    square_max DOUBLE PRECISION,
+    price_min DOUBLE PRECISION,
+    price_max DOUBLE PRECISION,
+    is_launch BOOLEAN,
+    start_of_sales DATE,
+    eoi JSONB,
+    noc JSONB,
+    units_updated_at TIMESTAMP WITHOUT TIME ZONE,
+    metrics JSONB,
+    status TEXT,
+    dld_number TEXT,
+    entity TEXT
+  );
+
+  CREATE TABLE unit_types (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+  );
+
+  CREATE TABLE unit_layouts (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+  );
+
+  CREATE TABLE units (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    number TEXT,
+    price DOUBLE PRECISION,
+    square DOUBLE PRECISION,
+    height TEXT,
+    floor TEXT,
+    type_id INTEGER REFERENCES unit_types(id),
+    layout_id INTEGER REFERENCES unit_layouts(id),
+    type_of_sale TEXT,
+    status TEXT,
+    views JSONB,
+    price_per_square_foot DOUBLE PRECISION,
+    last_price_change JSONB
+  );
+
+  CREATE TABLE payment_plans (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT,
+    post_handover BOOLEAN,
+    down_payment DOUBLE PRECISION
+  );
+
+  CREATE TABLE payment_plan_items (
+    id INTEGER PRIMARY KEY,
+    payment_plan_id INTEGER NOT NULL REFERENCES payment_plans(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT
+  );
+
+`;
+const sqlAgent = new Agent({
+  name: "SQL Agent",
+  instructions: `You are a SQL (PostgreSQL) expert for a database of real estate properties in Dubai. Generate and execute queries that answer user questions about available properties.
+    ${DB_SCHEMA}
+
+    QUERY GUIDELINES:
+    - **Retrieval Only:** Generate ONLY SELECT statements. Do not attempt INSERT, UPDATE, or DELETE.
+    - **Country Names:** Use full names like "United Kingdom" or "United States" if filtering by location implicitly.
+    - **Current Data:** The database reflects the current state; historical trend queries are not supported.
+    - **Visualization Focus:** Aim to return at least two columns suitable for tables or charts. If the user requests a single attribute, consider returning that attribute along with a count (e.g., SELECT district_name, COUNT(*) FROM projects GROUP BY district_name).
+    - **Rate Formatting:** Represent rates as decimals (e.g., 0.05 for 5%).
+    - **Targeted Queries:** Focus on relevant columns like \`projects.status\`, \`projects.handover\`, \`projects.price_min\`, \`projects.price_max\`, \`projects.square_min\`, \`projects.square_max\`, \`projects.has_resale\`, \`projects.has_off_plan\`, \`units.price\`, \`units.square\`, \`units.status\`, \`districts.name\`, \`companies.name\`.
+    - **Joins:** Use JOIN clauses (specifically INNER JOIN or LEFT JOIN as appropriate) to combine data from related tables (e.g., \`projects\` with \`districts\`, \`companies\`, or \`units\`).
+    - **Filtering:** Use the WHERE clause effectively. For text searches, prefer \`ILIKE\` for case-insensitivity (e.g., \`WHERE districts.name ILIKE '%marina%'\`). Use appropriate operators for numeric (\`=\`, \`>\`, \`<\`, \`BETWEEN\`) and date comparisons.
+    - **Clarity:** Prefer clear, straightforward queries. Avoid overly complex subqueries if a JOIN or simpler filter achieves the same result.
+
+    SQL FORMATTING:
+    - **Keywords:** Use consistent uppercase for SQL keywords (SELECT, FROM, WHERE, JOIN, GROUP BY, ORDER BY, etc.).
+    - **Line Breaks:** Start main clauses (SELECT, FROM, WHERE, GROUP BY, ORDER BY) on new lines. Place each JOIN clause on a new line.
+    - **Indentation:** Indent subqueries, JOIN conditions (ON), and items within clauses (e.g., columns in SELECT, conditions in WHERE) for readability.
+    - **Alignment:** Align related items vertically where it enhances clarity (e.g., multiple conditions in a WHERE clause).
+
+    WORKFLOW & OUTPUT TEMPLATE:
+    1.  **Analyze:** Carefully read the user's question to understand the specific information requested about Dubai real estate.
+    2.  **Plan Query:** Determine the necessary tables, columns, joins, and filters based on the database schema and query guidelines.
+    3.  **Generate SQL:** Construct the SQL query following the formatting guidelines.
+    4.  **Execute:** Use the provided SQL execution tool to run the query against the database.
+    5.  **Format Output:** Present the results clearly in markdown using the following template:
+
+        ### Analysis
+        [Briefly explain how the user's request translates to the database query. Mention key tables and filters used.]
+
+        ### SQL Query
+        \`\`\`sql
+        [Paste the exact, well-formatted SQL query that was executed.]
+        \`\`\`
+
+        ### Results
+        [Display the query results in a markdown table. If no results are found, state "No matching records found."]
+
+        ### Notes
+        [Optional: Add any relevant caveats, e.g., "Prices are in AED.", "Data reflects the latest update."]
+    `,
+  model: openai("gpt-4o"),
+  tools: {
+    realEstateInfo: realEstateInfo
+  }
+});
+
+const isPlainObject$1 = (obj) => Object.prototype.toString.call(obj) === "[object Object]";
+class TelegramIntegration {
+  bot;
+  MAX_MESSAGE_LENGTH = 4096;
+  // Telegram's message length limit
+  MAX_RESULT_ROWS = 10;
+  // Max rows for table formatting
+  MAX_RESULT_COLS = 5;
+  // Max cols for table formatting
+  MAX_COL_WIDTH = 30;
+  // Max width for table columns
+  isShuttingDown = false;
+  // Flag to prevent duplicate shutdown logic
+  constructor(token) {
+    console.log("Initializing TelegramIntegration...");
+    this.bot = new TelegramBot(token, {
+      polling: {
+        // Increase interval slightly during dev? Might help reduce immediate conflict on restart
+        interval: 500,
+        // milliseconds
+        params: { timeout: 10 }
+        // Keep timeout reasonable
+      }
+    });
+    this.bot.on("message", (msg) => {
+      console.log(`[${(/* @__PURE__ */ new Date()).toISOString()}] Received message event.`);
+      if (this.isShuttingDown) {
+        console.log("Shutdown in progress, ignoring incoming message.");
+        return;
+      }
+      this.handleMessage(msg);
+    });
+    this.bot.on("polling_error", (error) => {
+      if (!this.isShuttingDown) {
+        console.error("Telegram Polling Error:", error);
+      }
+    });
+    console.log("Telegram bot polling started...");
+    try {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Testing Telegram bot token validity...`
+      );
+      this.bot.getMe().then((botInfo) => {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] \u2705 Bot connection test successful! Connected as @${botInfo.username}`
+        );
+      }).catch((error) => {
+        console.error(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] \u274C Bot connection test failed:`,
+          error
+        );
+      });
+    } catch (error) {
+      console.error(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] \u274C Critical error during bot connection test:`,
+        error
+      );
+    }
+    this.bot.deleteWebHook().then(() => {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Successfully cleared any existing webhooks.`
+      );
+    }).catch((error) => {
+      console.error(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Error clearing webhooks:`,
+        error
+      );
+    });
+  }
+  // Method to gracefully stop the bot
+  async stop() {
+    if (this.isShuttingDown) {
+      return;
+    }
+    this.isShuttingDown = true;
+    console.log("Stopping Telegram bot polling...");
+    try {
+      await this.bot.stopPolling({ cancel: true });
+      console.log("Telegram bot polling stopped.");
+    } catch (error) {
+      console.error("Error stopping Telegram bot:", error);
+    }
+  }
+  escapeMarkdownV2(text) {
+    if (text === null || text === void 0) return "";
+    return String(text).replace(/([_*[\]()~`>#+=|{}.!-])/g, "\\$1");
+  }
+  truncateString(str, maxLength) {
+    if (str.length <= maxLength) return str;
+    return `${str.substring(0, maxLength - 15)}... [truncated]`;
+  }
+  // Format results, attempting nice tables for arrays of objects
+  formatToolResult(result) {
+    console.log(`[${(/* @__PURE__ */ new Date()).toISOString()}] Formatting tool result...`);
+    try {
+      if (isPlainObject$1(result) && result.error && typeof result.error === "string") {
+        return `\u274C Error from tool: ${this.escapeMarkdownV2(result.error)}`;
+      }
+      if (Array.isArray(result) && result.length > 0 && result.every(isPlainObject$1)) {
+        const headers = Object.keys(result[0]).slice(0, this.MAX_RESULT_COLS);
+        const headerLine = headers.map(
+          (h) => this.escapeMarkdownV2(this.truncateString(h, this.MAX_COL_WIDTH))
+        ).join(" | ");
+        const separatorLine = headers.map(() => "---").join(" | ");
+        const rows = result.slice(0, this.MAX_RESULT_ROWS).map(
+          (row) => headers.map(
+            (header) => this.escapeMarkdownV2(
+              this.truncateString(
+                // Safely access property, default to empty string if missing
+                String(row[header] ?? ""),
+                this.MAX_COL_WIDTH
+              )
+            )
+          ).join(" | ")
+        );
+        let table = `\`\`\`
+${headerLine}
+${separatorLine}
+${rows.join("\n")}
+`;
+        if (result.length > this.MAX_RESULT_ROWS) {
+          const remainingRows = result.length - this.MAX_RESULT_ROWS;
+          table += `... and ${remainingRows} more row${remainingRows > 1 ? "s" : ""} [truncated]
+`;
+        }
+        table += "```";
+        console.log(`[${(/* @__PURE__ */ new Date()).toISOString()}] Formatted as table.`);
+        return table;
+      }
+      const jsonString = JSON.stringify(result, null, 2);
+      const escapedJson = this.escapeMarkdownV2(
+        this.truncateString(jsonString, 1e3)
+        // Truncate before escaping
+      );
+      console.log(`[${(/* @__PURE__ */ new Date()).toISOString()}] Formatted as JSON.`);
+      return `\`\`\`json
+${escapedJson}
+\`\`\``;
+    } catch (error) {
+      console.error("Error formatting tool result:", error);
+      return this.escapeMarkdownV2(
+        `[Complex data structure - ${typeof result}]`
+      );
+    }
+  }
+  // Edits the last message or sends a new one if needed/too long
+  async updateStatusMessage(chatId, messageId, text) {
+    if (this.isShuttingDown) return messageId;
+    console.log(
+      `[${(/* @__PURE__ */ new Date()).toISOString()}] Updating status message ${messageId} in chat ${chatId}.`
+    );
+    try {
+      const escapedText = this.escapeMarkdownV2(text);
+      const truncatedText = this.truncateString(
+        escapedText,
+        this.MAX_MESSAGE_LENGTH
+      );
+      if (truncatedText.trim() === "") {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Skipping status update: empty content.`
+        );
+        return messageId;
+      }
+      await this.bot.editMessageText(truncatedText, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: "MarkdownV2"
+        // Ensure parse mode is set
+      });
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Successfully updated status message ${messageId}.`
+      );
+      return messageId;
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "response" in error && typeof error.response === "object" && error.response !== null && "body" in error.response && typeof error.response.body === "object" && error.response.body !== null && "description" in error.response.body && typeof error.response.body.description === "string" && error.response.body.description.includes("message is not modified")) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Status message ${messageId} not modified.`
+        );
+        return messageId;
+      }
+      if (this.isShuttingDown) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Ignoring status update error during shutdown.`
+        );
+        return messageId;
+      }
+      console.warn(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Failed to edit status message ${messageId}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+      return messageId;
+    }
+  }
+  // Appends text to the main response message, handling updates and length limits
+  async appendToMainResponse(chatId, messageId, currentFullResponse, textToAppend) {
+    if (this.isShuttingDown) {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Ignoring appendToMainResponse during shutdown.`
+      );
+      return {
+        updatedMessageId: messageId,
+        updatedFullResponse: currentFullResponse
+      };
+    }
+    console.log(
+      `[${(/* @__PURE__ */ new Date()).toISOString()}] Appending to message ${messageId} in chat ${chatId}.`
+    );
+    const newFullResponse = currentFullResponse + textToAppend;
+    if (newFullResponse.length <= this.MAX_MESSAGE_LENGTH) {
+      if (newFullResponse === currentFullResponse) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Skipping append: content identical.`
+        );
+        return {
+          updatedMessageId: messageId,
+          updatedFullResponse: currentFullResponse
+        };
+      }
+      try {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Attempting to edit message ${messageId} with new content.`
+        );
+        await this.bot.editMessageText(newFullResponse, {
+          chat_id: chatId,
+          message_id: messageId,
+          parse_mode: "MarkdownV2"
+          // Ensure parse mode is set
+        });
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Successfully edited message ${messageId}.`
+        );
+        return {
+          updatedMessageId: messageId,
+          updatedFullResponse: newFullResponse
+        };
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "response" in error && typeof error.response === "object" && error.response !== null && "body" in error.response && typeof error.response.body === "object" && error.response.body !== null && "description" in error.response.body && typeof error.response.body.description === "string" && error.response.body.description.includes("message is not modified")) {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Message ${messageId} not modified (caught during edit).`
+          );
+          return {
+            updatedMessageId: messageId,
+            updatedFullResponse: currentFullResponse
+            // Return the original if no change
+          };
+        }
+        if (this.isShuttingDown) {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Ignoring message edit error during shutdown.`
+          );
+          return {
+            updatedMessageId: messageId,
+            updatedFullResponse: currentFullResponse
+          };
+        }
+        console.error(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Error updating main message ${messageId} (edit attempt):`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    } else {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] New content exceeds max length (${newFullResponse.length}/${this.MAX_MESSAGE_LENGTH}). Sending new message.`
+      );
+    }
+    const truncatedAppend = this.truncateString(
+      textToAppend,
+      this.MAX_MESSAGE_LENGTH
+    );
+    if (truncatedAppend.trim() === "") {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Skipping sending new message: appended content is empty after truncation.`
+      );
+      return {
+        updatedMessageId: messageId,
+        updatedFullResponse: currentFullResponse
+      };
+    }
+    try {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending new continuation message in chat ${chatId}.`
+      );
+      const continuationMessage = await this.bot.sendMessage(
+        chatId,
+        truncatedAppend,
+        // Send the (potentially truncated) new part
+        { parse_mode: "MarkdownV2" }
+        // Ensure parse mode is set
+      );
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Successfully sent new message ${continuationMessage.message_id}.`
+      );
+      return {
+        updatedMessageId: continuationMessage.message_id,
+        updatedFullResponse: truncatedAppend
+        // The content of the latest message
+      };
+    } catch (error) {
+      if (this.isShuttingDown) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Ignoring send message error during shutdown.`
+        );
+        return {
+          updatedMessageId: messageId,
+          updatedFullResponse: currentFullResponse
+        };
+      }
+      console.error(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Error sending continuation message:`,
+        error instanceof Error ? error.message : String(error)
+      );
+      return {
+        updatedMessageId: messageId,
+        updatedFullResponse: currentFullResponse
+      };
+    }
+  }
+  async handleMessage(msg) {
+    console.log(
+      `[${(/* @__PURE__ */ new Date()).toISOString()}] --- Starting handleMessage for msg ID ${msg.message_id} ---`
+    );
+    if (this.isShuttingDown) {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] handleMessage: Ignoring due to shutdown flag.`
+      );
+      return;
+    }
+    const chatId = msg.chat.id;
+    const text = msg.text;
+    const username = msg.from?.username || "unknown";
+    const rawFirstName = msg.from?.first_name || "unknown";
+    const resourceId = msg.from?.id ? `telegram-${msg.from.id}` : `telegram-anonymous-${chatId}`;
+    const threadId = `telegram-${chatId}`;
+    console.log(
+      `[${(/* @__PURE__ */ new Date()).toISOString()}] Chat ID: ${chatId}, User: ${username} (${rawFirstName}), Text: "${text}"`
+    );
+    if (!text) {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Received non-text message, sending reply.`
+      );
+      await this.bot.sendMessage(
+        chatId,
+        this.escapeMarkdownV2(
+          "Sorry, I can only process text messages right now."
+        ),
+        { parse_mode: "MarkdownV2" }
+      );
+      return;
+    }
+    if (text.startsWith("/")) {
+      const command = text.split(" ")[0];
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Processing command: ${command}`
+      );
+      if (command === "/start") {
+        const rawWelcomeMessage = `Hello ${rawFirstName}! I'm Zara, your AI assistant for luxury real estate in Dubai. How can I help you find your perfect property today?`;
+        const escapedWelcomeMessage = this.escapeMarkdownV2(rawWelcomeMessage);
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending /start response to chat ${chatId}.`
+        );
+        await this.bot.sendMessage(chatId, escapedWelcomeMessage, {
+          parse_mode: "MarkdownV2"
+        });
+        return;
+      }
+      if (command === "/reset") {
+        const resetMessage = this.escapeMarkdownV2(
+          "Ok, I've reset our conversation context (Note: Full memory reset pending implementation). What would you like to discuss now?"
+        );
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending /reset response to chat ${chatId}.`
+        );
+        await this.bot.sendMessage(chatId, resetMessage, {
+          parse_mode: "MarkdownV2"
+        });
+        return;
+      }
+      const unknownCmdMsg = this.escapeMarkdownV2(
+        `Sorry, I don't recognize the command: ${command}`
+      );
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending unknown command response to chat ${chatId}.`
+      );
+      await this.bot.sendMessage(chatId, unknownCmdMsg, {
+        parse_mode: "MarkdownV2"
+      });
+      return;
+    }
+    let statusMessageText = "\u{1F9E0} Thinking...";
+    let mainResponseMessageContent = "";
+    let mainResponseMsgId = void 0;
+    let statusMsgId = void 0;
+    console.log(
+      `[${(/* @__PURE__ */ new Date()).toISOString()}] Entering main message processing block.`
+    );
+    try {
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending initial status message to chat ${chatId}.`
+      );
+      const initialStatusMsg = await this.bot.sendMessage(
+        chatId,
+        this.escapeMarkdownV2(statusMessageText),
+        // Escape initial status here
+        { parse_mode: "MarkdownV2" }
+      );
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Initial status message sent (ID: ${initialStatusMsg.message_id}).`
+      );
+      if (this.isShuttingDown) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Aborting processing: shutdown occurred after sending initial status.`
+        );
+        return;
+      }
+      statusMsgId = initialStatusMsg.message_id;
+      mainResponseMsgId = statusMsgId;
+      mainResponseMessageContent = this.escapeMarkdownV2(statusMessageText);
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Calling realEstateAgent.stream with threadId: ${threadId}`
+      );
+      const stream = await realEstateAgent.stream(text, {
+        // Use raw text input
+        threadId,
+        resourceId,
+        context: [
+          {
+            role: "system",
+            // Provide raw names, agent internally decides how to use them
+            content: `User info: Name=${rawFirstName}, Username=${username}`
+          }
+        ]
+      });
+      console.log(`[${(/* @__PURE__ */ new Date()).toISOString()}] Agent stream obtained.`);
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Starting to process agent stream chunks...`
+      );
+      for await (const chunk of stream.fullStream) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Received stream chunk: ${JSON.stringify(chunk)}`
+        );
+        if (this.isShuttingDown) {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Breaking stream loop due to shutdown.`
+          );
+          break;
+        }
+        let escapedChunkContent = "";
+        switch (chunk.type) {
+          case "text-delta":
+            escapedChunkContent = this.escapeMarkdownV2(chunk.textDelta);
+            if (statusMessageText !== "\u{1F9E0} Thinking...") {
+              console.log(
+                `[${(/* @__PURE__ */ new Date()).toISOString()}] Resetting status to 'Thinking...' due to text-delta.`
+              );
+              statusMessageText = "\u{1F9E0} Thinking...";
+              if (statusMsgId) {
+                await this.updateStatusMessage(
+                  chatId,
+                  statusMsgId,
+                  statusMessageText
+                );
+              }
+            }
+            break;
+          case "tool-call": {
+            const toolName = chunk.toolName ?? "unknown_tool";
+            const argsString = this.truncateString(
+              JSON.stringify(chunk.args ?? {}),
+              200
+            );
+            statusMessageText = `\u{1F6E0}\uFE0F Using tool: *${toolName}*...`;
+            console.log(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Updating status for tool call: ${toolName}`
+            );
+            if (statusMsgId) {
+              await this.updateStatusMessage(
+                chatId,
+                statusMsgId,
+                statusMessageText
+              );
+            }
+            escapedChunkContent = `
+*(Using tool: ${this.escapeMarkdownV2(toolName)} with args: \`${this.escapeMarkdownV2(argsString)}\`)*
+`;
+            console.log(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Tool call logged: ${toolName}`,
+              chunk.args
+            );
+            break;
+          }
+          case "tool-result": {
+            const toolName = chunk.toolName ?? "unknown_tool";
+            const formattedResult = this.formatToolResult(chunk.result);
+            escapedChunkContent = `
+\u2728 Result from *${this.escapeMarkdownV2(toolName)}*:
+${formattedResult}
+`;
+            console.log(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Tool result received for: ${toolName}`,
+              chunk.result
+            );
+            statusMessageText = "\u{1F9E0} Thinking...";
+            console.log(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Resetting status to 'Thinking...' after tool result.`
+            );
+            if (statusMsgId) {
+              await this.updateStatusMessage(
+                chatId,
+                statusMsgId,
+                statusMessageText
+              );
+            }
+            break;
+          }
+          case "error":
+            escapedChunkContent = `
+\u274C Error: ${this.escapeMarkdownV2(String(chunk.error))}
+`;
+            console.error(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Stream Error chunk:`,
+              chunk.error
+            );
+            statusMessageText = "\u26A0\uFE0F Error encountered";
+            if (statusMsgId) {
+              await this.updateStatusMessage(
+                chatId,
+                statusMsgId,
+                statusMessageText
+              );
+            }
+            break;
+        }
+        if (escapedChunkContent && mainResponseMsgId) {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Calling appendToMainResponse for message ${mainResponseMsgId}.`
+          );
+          const { updatedMessageId, updatedFullResponse } = await this.appendToMainResponse(
+            chatId,
+            mainResponseMsgId,
+            mainResponseMessageContent,
+            // Pass the current *escaped* message content
+            escapedChunkContent
+            // Pass the *escaped* chunk content
+          );
+          mainResponseMsgId = updatedMessageId;
+          mainResponseMessageContent = updatedFullResponse;
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] appendToMainResponse finished. New message ID: ${mainResponseMsgId}.`
+          );
+        } else {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Skipping append: Chunk empty or mainResponseMsgId missing (${!escapedChunkContent}, ${!mainResponseMsgId}).`
+          );
+        }
+      }
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Finished processing agent stream chunks.`
+      );
+      if (this.isShuttingDown) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Skipping final cleanup due to shutdown.`
+        );
+        return;
+      }
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Entering final cleanup phase...`
+      );
+      const isFinalMessageJustInitialStatus = mainResponseMsgId === statusMsgId && mainResponseMessageContent === this.escapeMarkdownV2("\u{1F9E0} Thinking...");
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Final cleanup check: statusMsgId=${statusMsgId}, mainResponseMsgId=${mainResponseMsgId}, isFinalMessageJustInitialStatus=${isFinalMessageJustInitialStatus}`
+      );
+      if (statusMsgId && statusMsgId !== mainResponseMsgId && !isFinalMessageJustInitialStatus) {
+        try {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Deleting status message ${statusMsgId} as it differs from main message ${mainResponseMsgId}.`
+          );
+          await this.bot.deleteMessage(chatId, statusMsgId);
+        } catch (delError) {
+          console.warn(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Minor error deleting final status message ${statusMsgId}:`,
+            delError
+          );
+        }
+      }
+      if (isFinalMessageJustInitialStatus && !mainResponseMessageContent.includes(this.escapeMarkdownV2("Error:"))) {
+        const finalMsgText = "Finished processing. How else can I assist?";
+        const finalMsg = this.escapeMarkdownV2(finalMsgText);
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Main message ${mainResponseMsgId} only contains initial status; updating.`
+        );
+        if (mainResponseMsgId) {
+          try {
+            await this.updateStatusMessage(
+              chatId,
+              mainResponseMsgId,
+              finalMsgText
+              // Pass raw text
+            );
+            console.log(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Successfully updated final empty status message ${mainResponseMsgId}.`
+            );
+          } catch (finalUpdateError) {
+            console.error(
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] Error updating final empty status message ${mainResponseMsgId}:`,
+              finalUpdateError
+            );
+            try {
+              console.log(
+                `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending fallback final message to chat ${chatId}.`
+              );
+              await this.bot.sendMessage(chatId, finalMsg, {
+                parse_mode: "MarkdownV2"
+              });
+            } catch (fallbackSendError) {
+              console.error(
+                `[${(/* @__PURE__ */ new Date()).toISOString()}] Error sending fallback final message:`,
+                fallbackSendError
+              );
+            }
+          }
+        }
+      }
+      console.log(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] --- Finished handleMessage for msg ID ${msg.message_id} ---`
+      );
+    } catch (error) {
+      if (this.isShuttingDown) {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Ignoring critical error during shutdown.`
+        );
+        return;
+      }
+      console.error(
+        `[${(/* @__PURE__ */ new Date()).toISOString()}] Critical error in handleMessage for chat ${chatId} (msg ID ${msg.message_id}):`,
+        error
+        // Log the full error object
+      );
+      if (statusMsgId) {
+        try {
+          console.log(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Attempting to delete status message ${statusMsgId} after critical error.`
+          );
+          await this.bot.deleteMessage(chatId, statusMsgId);
+        } catch (delError) {
+          console.warn(
+            `[${(/* @__PURE__ */ new Date()).toISOString()}] Failed to delete status message ${statusMsgId} after critical error:`,
+            delError
+          );
+        }
+      }
+      const errorMsg = this.escapeMarkdownV2(
+        "\u{1F625} Sorry, a critical error occurred while processing your request. Please try again later."
+      );
+      try {
+        console.log(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Sending critical error message to chat ${chatId}.`
+        );
+        await this.bot.sendMessage(chatId, errorMsg, {
+          parse_mode: "MarkdownV2"
+        });
+      } catch (sendError) {
+        console.error(
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] Failed to send critical error message to user ${chatId}:`,
+          sendError
+        );
+      }
+    }
+  }
+}
 
 dotenv.config();
 const knowledgeVectorStore = new PgVector({
@@ -79,7 +1039,8 @@ const knowledgeVectorStore = new PgVector({
 });
 const mastra = new Mastra({
   agents: {
-    realEstateAgent
+    realEstateAgent,
+    sqlAgent
   },
   vectors: {
     general_knowledge: knowledgeVectorStore
@@ -89,6 +1050,20 @@ const mastra = new Mastra({
     level: "info"
   })
 });
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error("TELEGRAM_BOT_TOKEN is not set in environment variables");
+  process.exit(1);
+}
+const telegramBot = new TelegramIntegration(TELEGRAM_BOT_TOKEN);
+const gracefulShutdown = async (signal) => {
+  console.log(`Received ${signal}. Shutting down gracefully...`);
+  await telegramBot.stop();
+  console.log("Shutdown complete. Exiting...");
+  setTimeout(() => process.exit(0), 500);
+};
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // src/utils/filepath.ts
 var getFilePath = (options) => {
