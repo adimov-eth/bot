@@ -140,12 +140,12 @@ export class TelegramIntegration {
 
 		// Regular text -------------------------------------------------------
 		const stopTyping = this.startTyping(chatId);
-		let response = "";
+		const response = "";
 
 		try {
 			// We still leverage the stream API, but buffer everything locally
-			const stream = await realEstateAgent.stream(text, {
-				threadId: `telegram-${chatId}`, // Use chat ID for thread
+			const message = await realEstateAgent.generate(text, {
+				threadId: `telegram2-${chatId}`, // Use chat ID for thread
 				resourceId: userId, // Use defined userId
 				// Pass additional context, including the chatId
 				context: [
@@ -160,15 +160,14 @@ export class TelegramIntegration {
 				// No system context message about user name to prevent it showing up in responses
 			});
 
-			for await (const chunk of stream.fullStream) {
-				// Only buffer content; nothing is sent to the user yet
-				if (chunk.type === "text-delta") {
-					response += chunk.textDelta;
-				} else if (chunk.type === "tool-result") {
-					response += "";
-				} else if (chunk.type === "error") {
-					response += `\nError: ${String(chunk.error)}\n`;
-				}
+			// // Response should already be clean from the agent/tool
+			// response = response.trim() || "¯\\_(ツ)_/¯";
+			stopTyping();
+			const messages = this.chunkMessage(message.text ?? "");
+			// const parse_mode = "Markdown";
+			for (const part of messages) {
+				// Send plain text without parse_mode
+				await this.bot.sendMessage(chatId, part);
 			}
 		} catch (e) {
 			stopTyping();
@@ -177,19 +176,6 @@ export class TelegramIntegration {
 				"Sorry, an error occurred. Please try again later.",
 			);
 			console.error("Agent error", e);
-			return;
-		}
-
-		stopTyping();
-
-		// Response should already be clean from the agent/tool
-		response = response.trim() || "¯\\_(ツ)_/¯";
-
-		const messages = this.chunkMessage(response);
-		// const parse_mode = "Markdown";
-		for (const part of messages) {
-			// Send plain text without parse_mode
-			await this.bot.sendMessage(chatId, part);
 		}
 	}
 }

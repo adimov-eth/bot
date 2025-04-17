@@ -27,103 +27,6 @@ import { Telemetry } from '@mastra/core';
 import { Container } from '@mastra/core/di';
 import { ReadableStream as ReadableStream$1 } from 'node:stream/web';
 
-const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_CONNECTION_STRING2 || "",
-  // Added connection string
-  max: 20,
-  idleTimeoutMillis: 3e4,
-  connectionTimeoutMillis: 2e4
-});
-pool.on("error", (err) => {
-  console.error("Unexpected error on idle client", err);
-});
-const executeQuery = async (query) => {
-  const client = await pool.connect();
-  try {
-    const result = await client.query(query);
-    return result.rows;
-  } catch (error) {
-    throw new Error(
-      `Failed to execute query: ${error instanceof Error ? error.message : String(error)}`
-    );
-  } finally {
-    client.release();
-  }
-};
-const realEstateInfo = createTool({
-  id: "Execute SQL Query",
-  inputSchema: z.object({
-    query: z.string().describe("SQL query to execute against the cities database")
-  }),
-  description: "Executes a SQL query against the cities database and returns the results",
-  execute: async ({ context: { query } }) => {
-    try {
-      const trimmedQuery = query.trim().toLowerCase();
-      if (!trimmedQuery.startsWith("select")) {
-        throw new Error("Only SELECT queries are allowed for security reasons");
-      }
-      return await executeQuery(query);
-    } catch (error) {
-      throw new Error(
-        `Failed to execute SQL query: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-});
-const delegatePropertyQueryTool = createTool({
-  id: "Delegate Property Query",
-  inputSchema: z.object({
-    naturalLanguageQuery: z.string().describe(
-      "The user's request about properties, phrased in natural language, to be passed to the SQL expert agent."
-    )
-  }),
-  description: "Passes a natural language query about properties to the SQL expert agent for database searching and returns the results.",
-  execute: async ({ context, mastra: mastraInstance, ...rest }) => {
-    try {
-      if (!mastraInstance) {
-        throw new Error(
-          "Mastra instance not available in tool execution context."
-        );
-      }
-      console.log(
-        `[delegatePropertyQueryTool] Received query: ${context.naturalLanguageQuery}`
-      );
-      const sqlAgentInstance = mastraInstance.getAgent("sqlAgent");
-      if (!sqlAgentInstance) {
-        throw new Error("SQL Agent instance not found via Mastra context.");
-      }
-      console.log(
-        "[delegatePropertyQueryTool] Invoking sqlAgentInstance.generate..."
-      );
-      const result = await sqlAgentInstance.generate(
-        [
-          {
-            role: "system",
-            content: "IMPORTANT: Respond with plain text only. DO NOT include ANY section headers like 'ANALYSIS', 'SQL QUERY', 'RESULTS', or 'NOTES' in your response. DO NOT use any markdown formatting, no headings, no code blocks, no bold/italics. Your response should only contain the actual results and a brief explanation in plain text format. Do not add system messages or any formatting to your response."
-          },
-          { role: "user", content: context.naturalLanguageQuery }
-        ],
-        // Access query via context
-        {
-          // Optional: Configuration for the agent call
-        }
-      );
-      console.log(
-        `[delegatePropertyQueryTool] Received result from sqlAgent: ${JSON.stringify(result)}`
-      );
-      return result;
-    } catch (error) {
-      const errorMessage = `Failed to delegate query to SQL Agent: ${error instanceof Error ? error.message : String(error)}`;
-      console.error("[delegatePropertyQueryTool] Error:", errorMessage);
-      return {
-        error: errorMessage,
-        results: []
-      };
-    }
-  }
-});
-
 const agentMemory = new Memory({
   storage: new PostgresStore({
     connectionString: process.env.POSTGRES_CONNECTION_STRING || ""
@@ -153,7 +56,8 @@ const agentMemory = new Memory({
   - Preferred Districts: {{preferredDistricts}}
   - Must-haves: {{mustHaves}}
   - Preferred time for a call: {{preferredTimeForCall}}
-  `
+  `,
+      use: "tool-call"
     }
   }
 });
@@ -259,7 +163,7 @@ const realEstateAgent = new Agent({
 Be concise.
 Over the course of conversation, adapt to the user\u2019s tone and preferences. Try to match the user\u2019s vibe, tone, and generally how they are speaking. You want the conversation to feel natural. You engage in authentic conversation by responding to the information provided, asking relevant questions, and showing genuine curiosity. If natural, use information you know about the user to personalize your responses and ask a follow up question. Find perfect manner to choose words for every client individually.
 
-Your goal is to understand client needs for buying property in Dubai (residence, investment, vacation), provide informed market insights using your knowledge base tool ('knowledgeBaseSearchTool'), recommend relevant properties by asking the database specialist agent using the property query delegation tool ('delegatePropertyQueryTool'), build rapport, and efficiently schedule qualified leads for a follow-up call with our sales team.
+Your goal is to understand client needs for buying property in Dubai (residence, investment, vacation), provide informed market insights using your knowledge base tool ('knowledgeBaseSearchTool'), build rapport, and efficiently schedule qualified leads for a follow-up call with our sales team.
 Main goal is to make client schedule a call with a human agent, be proactive but polite and not too pushy.
 
 **Conversation Flow:**
@@ -292,21 +196,15 @@ Main goal is to make client schedule a call with a human agent, be proactive but
 
     *   **Use Tool:** Call the 'propertyKnowledgeBaseSearchTool' to lookup RAG knowledge base, it uses semantic search to find properties that match the user's criteria.
 
-
-    6.  **Delegate Property Query:**
-        *   **Trigger:** Once preferences seem reasonably stable or the user asks for listings.
-        *   **Use Tool:** Call the 'delegatePropertyQueryTool'. Formulate a clear, natural language request based on the gathered criteria. It uses SQL to query the database. Example Task for Tool: Provide the natural language query: \`"Find available 3-bedroom villas in Arabian Ranches or Dubai Hills with a budget between 4.5M and 5.5M AED. Include price, size, and floor number if possible."\`
-        *   Receive & Integrate: Receive the property information from the 'delegatePropertyQueryTool'. **Do not just output the tool's exact text.** Instead, **integrate the key findings naturally into your response**, using your friendly and knowledgeable Zara persona. Rephrase the information concisely. For example, if the tool returns "Project Alpha in Dubai Marina has a 2-bedroom apartment for AED 2.5M", you might say: "I've found a lovely 2-bedroom apartment in Project Alpha right in Dubai Marina, listed at AED 2.5M. That seems to fit nicely with what you mentioned about location preference. What are your initial thoughts on that?" Always ensure the final message is helpful, maintains the conversation flow, and adheres to the plain text requirement.
-
     7.  **Refinement Loop:** Always invite interaction: "What do you think of these options?", "Would you like me to ask the specialist to refine the search based on your feedback?", "Any questions about these listings?"
 
     8.  **Schedule Sales Call:**
         *   **Readiness Signals:** Be proactive, after brief chat about real estate market and once you see any hesitation gently push client to have a call with human agent. 
         *   **Propose Call:** "It seems like we've narrowed down some good possibilities! Would you be open to a quick chat with one of our property specialists? They can provide more in-depth details, discuss current availability, and walk you through the buying process."
-        *   **Use Tool:** If they agree, ask for their availability ask for preferred days or times that work best for the client and then use the 'scheduleCall' tool, passing their name, contact (it's automatic), preferred times, and a brief note summarizing their key interests.
+        *   **Use Tool:** If they agree, ask for their availability ask for preferred days or times that work best for the client and then use the 'notifyOperatorTool' tool, passing their name, contact (it's automatic), preferred times, and a brief note summarizing their key interests.
         *   **Handle Hesitation:** If unsure: "No problem at all. We can continue chatting here, or I can have someone send you more detailed brochures via email first. What works best?"
 
-    9.  **Fallback:** If 'knowledgeBaseSearchTool' returns no relevant info or 'delegatePropertyQueryTool' indicates no matches found by the specialist: (!) Do not inform client about any problems on backend side. Just turn conversation into call scheduling. " "Hmm, I couldn't find specific data/listings for that exact combination right now. We could try asking the specialist to adjust the criteria slightly (e.g., explore nearby districts, different property type?), or perhaps a quick call with an expert could uncover some unlisted options?"
+    9.  **Fallback:** If 'knowledgeBaseSearchTool' returns no relevant info or  indicates no matches found by the specialist: (!) Do not inform client about any problems on backend side. Just turn conversation into call scheduling. " "Hmm, I couldn't find specific data/listings for that exact combination right now. We could try asking the specialist to adjust the criteria slightly (e.g., explore nearby districts, different property type?), or perhaps a quick call with an expert could uncover some unlisted options?"
 
     **Tone & Style:** Maintain a friendly, professional, empathetic, knowledgeable, and helpful tone. Be concise for WhatsApp. Always respect the user's pace.
 
@@ -319,11 +217,108 @@ Main goal is to make client schedule a call with a human agent, be proactive but
   tools: {
     knowledgeBaseSearchTool,
     propertyKnowledgeBaseSearchTool,
-    delegatePropertyQueryTool,
+    // delegatePropertyQueryTool,
     notifyOperatorTool
     // scheduleCallTool, // Placeholder: Add scheduling tool when available
   },
   memory: agentMemory
+});
+
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_CONNECTION_STRING2 || "",
+  // Added connection string
+  max: 20,
+  idleTimeoutMillis: 3e4,
+  connectionTimeoutMillis: 2e4
+});
+pool.on("error", (err) => {
+  console.error("Unexpected error on idle client", err);
+});
+const executeQuery = async (query) => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(query);
+    return result.rows;
+  } catch (error) {
+    throw new Error(
+      `Failed to execute query: ${error instanceof Error ? error.message : String(error)}`
+    );
+  } finally {
+    client.release();
+  }
+};
+const realEstateInfo = createTool({
+  id: "Execute SQL Query",
+  inputSchema: z.object({
+    query: z.string().describe("SQL query to execute against the cities database")
+  }),
+  description: "Executes a SQL query against the cities database and returns the results",
+  execute: async ({ context: { query } }) => {
+    try {
+      const trimmedQuery = query.trim().toLowerCase();
+      if (!trimmedQuery.startsWith("select")) {
+        throw new Error("Only SELECT queries are allowed for security reasons");
+      }
+      return await executeQuery(query);
+    } catch (error) {
+      throw new Error(
+        `Failed to execute SQL query: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+});
+createTool({
+  id: "Delegate Property Query",
+  inputSchema: z.object({
+    naturalLanguageQuery: z.string().describe(
+      "The user's request about properties, phrased in natural language, to be passed to the SQL expert agent."
+    )
+  }),
+  description: "Passes a natural language query about properties to the SQL expert agent for database searching and returns the results.",
+  execute: async ({ context, mastra: mastraInstance, ...rest }) => {
+    try {
+      if (!mastraInstance) {
+        throw new Error(
+          "Mastra instance not available in tool execution context."
+        );
+      }
+      console.log(
+        `[delegatePropertyQueryTool] Received query: ${context.naturalLanguageQuery}`
+      );
+      const sqlAgentInstance = mastraInstance.getAgent("sqlAgent");
+      if (!sqlAgentInstance) {
+        throw new Error("SQL Agent instance not found via Mastra context.");
+      }
+      console.log(
+        "[delegatePropertyQueryTool] Invoking sqlAgentInstance.generate..."
+      );
+      const result = await sqlAgentInstance.generate(
+        [
+          {
+            role: "system",
+            content: "IMPORTANT: Respond with plain text only. DO NOT include ANY section headers like 'ANALYSIS', 'SQL QUERY', 'RESULTS', or 'NOTES' in your response. DO NOT use any markdown formatting, no headings, no code blocks, no bold/italics. Your response should only contain the actual results and a brief explanation in plain text format. Do not add system messages or any formatting to your response."
+          },
+          { role: "user", content: context.naturalLanguageQuery }
+        ],
+        // Access query via context
+        {
+          // Optional: Configuration for the agent call
+        }
+      );
+      console.log(
+        `[delegatePropertyQueryTool] Received result from sqlAgent: ${JSON.stringify(result)}`
+      );
+      return result;
+    } catch (error) {
+      const errorMessage = `Failed to delegate query to SQL Agent: ${error instanceof Error ? error.message : String(error)}`;
+      console.error("[delegatePropertyQueryTool] Error:", errorMessage);
+      return {
+        error: errorMessage,
+        results: []
+      };
+    }
+  }
 });
 
 const DB_SCHEMA = `
@@ -569,10 +564,9 @@ ${rows}`;
     const userName = msg.from?.first_name ?? "there";
     const userId = msg.from?.id ? `telegram-${msg.from.id}` : `telegram-${chatId}`;
     const stopTyping = this.startTyping(chatId);
-    let response = "";
     try {
-      const stream = await realEstateAgent.stream(text, {
-        threadId: `telegram-${chatId}`,
+      const message = await realEstateAgent.generate(text, {
+        threadId: `telegram2-${chatId}`,
         // Use chat ID for thread
         resourceId: userId,
         // Use defined userId
@@ -588,14 +582,10 @@ ${rows}`;
         ]
         // No system context message about user name to prevent it showing up in responses
       });
-      for await (const chunk of stream.fullStream) {
-        if (chunk.type === "text-delta") {
-          response += chunk.textDelta;
-        } else if (chunk.type === "error") {
-          response += `
-Error: ${String(chunk.error)}
-`;
-        }
+      stopTyping();
+      const messages = this.chunkMessage(message.text ?? "");
+      for (const part of messages) {
+        await this.bot.sendMessage(chatId, part);
       }
     } catch (e) {
       stopTyping();
@@ -604,14 +594,6 @@ Error: ${String(chunk.error)}
         "Sorry, an error occurred. Please try again later."
       );
       console.error("Agent error", e);
-      return;
-    }
-    stopTyping();
-    response = response.trim() || "\xAF\\_(\u30C4)_/\xAF";
-    const messages = this.chunkMessage(response);
-    const parse_mode = "Markdown";
-    for (const part of messages) {
-      await this.bot.sendMessage(chatId, part, { parse_mode });
     }
   }
 }
