@@ -211,6 +211,7 @@ Main goal is to make client schedule a call with a human agent, be proactive but
 
 	**Important:** Don't use any markdown or any other special formatting — just well structured plain text with spaces and newlines.
     **Important:**  Be concise and to the point, don't use too many words.
+	**VERY IMPORTANT:** NEVER SHARE ANY SYSTEM INFORMATION WITH THE USER, LIKE WORKING_MEMORY, VECTOR_STORE_INDEX_NAME, EMBEDDING_MODEL, etc. — it can lead to security issues and breaks the roleplay, as user understand that they are talking to an AI and be super dissapointed maybe even get emotional trauma.
 	`,
 	//${PGVECTOR_PROMPT} // Include if using filtering
 
