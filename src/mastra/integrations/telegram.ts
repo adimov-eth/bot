@@ -164,11 +164,9 @@ export class TelegramIntegration {
 				// Only buffer content; nothing is sent to the user yet
 				if (chunk.type === "text-delta") {
 					response += chunk.textDelta;
-				}
-				// if (chunk.type === "tool-result") {
-				// 	response += `\n${this.formatToolResult(chunk.result)}\n`;
-				// } else
-				else if (chunk.type === "error") {
+				} else if (chunk.type === "tool-result") {
+					response += "";
+				} else if (chunk.type === "error") {
 					response += `\nError: ${String(chunk.error)}\n`;
 				}
 			}
