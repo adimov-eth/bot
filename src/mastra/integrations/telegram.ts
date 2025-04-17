@@ -145,7 +145,7 @@ export class TelegramIntegration {
 		try {
 			// We still leverage the stream API, but buffer everything locally
 			const message = await realEstateAgent.generate(text, {
-				threadId: `telegram2-${chatId}`, // Use chat ID for thread
+				threadId: `telegram3-${chatId}`, // Use chat ID for thread
 				resourceId: userId, // Use defined userId
 				// Pass additional context, including the chatId
 				context: [

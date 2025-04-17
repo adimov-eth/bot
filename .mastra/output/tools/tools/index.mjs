@@ -83,7 +83,7 @@ const delegatePropertyQueryTool = createTool({
         }
       );
       console.log(`[delegatePropertyQueryTool] Received result from sqlAgent: ${JSON.stringify(result)}`);
-      return result;
+      return result.text;
     } catch (error) {
       const errorMessage = `Failed to delegate query to SQL Agent: ${error instanceof Error ? error.message : String(error)}`;
       console.error("[delegatePropertyQueryTool] Error:", errorMessage);

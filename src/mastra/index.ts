@@ -14,7 +14,7 @@ const knowledgeVectorStore = new PgVector({
 });
 
 export const mastra = new Mastra({
-	agents: { realEstateAgent, sqlAgent },
+	agents: { realEstateAgent },
 	vectors: {
 		general_knowledge: knowledgeVectorStore,
 	},
