@@ -1,8 +1,11 @@
 import { openai } from "@ai-sdk/openai";
 import { Agent } from "@mastra/core/agent";
+import { createTool } from "@mastra/core/tools";
 import { Memory } from "@mastra/memory";
 import { PgVector, PostgresStore } from "@mastra/pg";
 import { PGVECTOR_PROMPT, createVectorQueryTool } from "@mastra/rag";
+import TelegramBot from "node-telegram-bot-api";
+import { z } from "zod";
 import { delegatePropertyQueryTool } from "../tools";
 
 const agentMemory = new Memory({
@@ -14,9 +17,25 @@ const agentMemory = new Memory({
 	}),
 	// embedder: ...,
 	options: {
-		// Memory configuration options like lastMessages, semanticRecall, etc.
-		lastMessages: 50,
-		semanticRecall: true,
+		lastMessages: 30,
+		semanticRecall: {
+			topK: 3, // Retrieve top 3 similar past messages
+			messageRange: 2, // Include 1 message before/after match
+		},
+		workingMemory: {
+			enabled: true, // Store persistent facts about the user
+			template: `# User Profile
+- Name: {{userName}}
+- Goal: {{userGoal}} # Investment, Residence, Vacation
+- Budget Range: {{budgetRange}} # e.g., AED 2M - 3M
+- Key Preferences: # e.g., 3+ bedrooms, villa, family-friendly, near Downtown
+  - Property Type: {{propertyType}}
+  - Bedrooms: {{bedrooms}}
+  - Preferred Districts: {{preferredDistricts}}
+  - Must-haves: {{mustHaves}}
+  - Preferred time for a call: {{preferredTimeForCall}}
+  `,
+		},
 	},
 });
 
@@ -24,59 +43,183 @@ const VECTOR_STORE_INDEX_NAME = "general_knowledge";
 const EMBEDDING_MODEL = openai.embedding("text-embedding-3-small");
 
 const knowledgeBaseSearchTool = createVectorQueryTool({
-	// A unique ID for the tool instance if needed, otherwise defaults
-	// id: 'markdownKnowledgeSearch',
 	vectorStoreName: "general_knowledge", // Must match the key used in Mastra constructor
 	indexName: VECTOR_STORE_INDEX_NAME,
 	model: EMBEDDING_MODEL, // For embedding the user's query
 	description:
-		"Searches the knowledge base for information about districts and neighborhoods of Dubai.", // Crucial for the agent
-	// Optional: Enable filtering or reranking
-	// enableFilter: true,
-	// reranker: { model: openai('gpt-4o-mini') }
+		"Searches the knowledge base for general information and facts about Dubai, its districts and neighborhoods.", // Crucial for the agent
+	reranker: {
+		model: openai("gpt-4o-mini"),
+		options: {
+			weights: {
+				semantic: 0.5, // Semantic relevance weight
+				vector: 0.3, // Vector similarity weight
+				position: 0.2, // Original position weight
+			},
+			topK: 5,
+		},
+	},
+});
+
+const propertyKnowledgeBaseSearchTool = createVectorQueryTool({
+	vectorStoreName: "property_knowledge", // Must match the key used in Mastra constructor
+	indexName: VECTOR_STORE_INDEX_NAME,
+	model: EMBEDDING_MODEL, // For embedding the user's query
+	description:
+		"Searches the knowledge base for information about properties in Dubai, their prices, locations, and other details.", // Crucial for the agent
+	reranker: {
+		model: openai("gpt-4o-mini"),
+		options: {
+			weights: {
+				semantic: 0.5, // Semantic relevance weight
+				vector: 0.3, // Vector similarity weight
+				position: 0.2, // Original position weight
+			},
+			topK: 5,
+		},
+	},
+});
+
+// New tool to notify operator via Telegram
+export const notifyOperatorTool = createTool({
+	id: "Notify Operator",
+	inputSchema: z.object({
+		userName: z
+			.string()
+			.nullable()
+			.optional()
+			.describe("The user's first name, if known."),
+		userGoal: z
+			.string()
+			.nullable()
+			.describe("The user's primary goal (e.g., Investment, Residence)."),
+		budget: z
+			.string()
+			.nullable()
+			.optional()
+			.describe("The user's budget range."),
+		preferencesSummary: z
+			.string()
+			.nullable()
+			.describe("A concise summary of the user's key property preferences."),
+		preferredCallTime: z
+			.string()
+			.nullable()
+			.optional()
+			.describe("The user's preferred time or days for a follow-up call."),
+		chatId: z
+			.string()
+			.nullable()
+			.describe("The Telegram chat ID of the conversation thread for context."), // Added chatId
+	}),
+	description:
+		"Sends a notification message with lead details to the designated Telegram operator.",
+	execute: async ({ context }) => {
+		const operatorChatId = process.env.TELEGRAM_OPERATOR_CHAT_ID || 208409637;
+		const botToken = process.env.TELEGRAM_BOT_TOKEN; // Assuming the main bot token is used
+
+		if (!operatorChatId || !botToken) {
+			const errorMsg =
+				"Operator Chat ID or Bot Token not configured in environment variables.";
+			console.error(`[notifyOperatorTool] Error: ${errorMsg}`);
+			return { success: false, error: errorMsg };
+		}
+
+		// Construct the message
+		let message = "🔔 New Lead Ready for Follow-up 🔔\n\n";
+		message += `User Name: ${context.userName || "Not provided"}\n`;
+		message += `Goal: ${context.userGoal}\n`;
+		if (context.budget) message += `Budget: ${context.budget}\n`;
+		message += `Preferences: ${context.preferencesSummary}\n`;
+		if (context.preferredCallTime)
+			message += `Preferred Call Time: ${context.preferredCallTime}\n`;
+		message += `\nChat ID: ${context.chatId}`; // Include chat ID
+
+		try {
+			// Create a temporary bot instance to send the message
+			// Note: This doesn't start polling, just allows sending.
+			const tempBot = new TelegramBot(botToken);
+			await tempBot.sendMessage(operatorChatId, message);
+			console.log(
+				`[notifyOperatorTool] Notification sent to operator chat ID ${operatorChatId}`,
+			);
+			return { success: true, message: "Notification sent successfully." };
+		} catch (error) {
+			const errorMsg = `Failed to send notification: ${error instanceof Error ? error.message : String(error)}`;
+			console.error(`[notifyOperatorTool] Error: ${errorMsg}`);
+			return { success: false, error: errorMsg };
+		}
+	},
 });
 
 export const realEstateAgent: Agent = new Agent({
 	name: "Real Estate Agent",
-	instructions: `You are Zara, a friendly, knowledgeable, and empathetic AI assistant from "Seven Luxury Real Estate", specializing in high-end villas and investment apartments. Your goal is to understand client needs for buying property in Dubai (residence, investment, vacation), provide informed market insights using your knowledge base tool ('knowledgeBaseSearchTool'), recommend relevant properties by asking the database specialist agent using the property query delegation tool ('delegatePropertyQueryTool'), build rapport, and efficiently schedule qualified leads for a follow-up call with our sales team (scheduling tool assumed available).
+	instructions: `You are Zara, a friendly, knowledgeable, and empathetic AI assistant from "Seven Luxury Real Estate", specializing in high-end villas and investment apartments. 
+Be concise.
+Over the course of conversation, adapt to the user’s tone and preferences. Try to match the user’s vibe, tone, and generally how they are speaking. You want the conversation to feel natural. You engage in authentic conversation by responding to the information provided, asking relevant questions, and showing genuine curiosity. If natural, use information you know about the user to personalize your responses and ask a follow up question. Find perfect manner to choose words for every client individually.
 
-    **Conversation Flow & Logic:**
-    1.  **Greeting & Name:** Start warmly: "Hello! I'm Zara from Seven Luxury Real Estate, your expert guide to Dubai's premium real estate. It's great to connect! To make our chat more personal, could I get your first name?" If provided, use it. If declined, proceed politely. Maybe ask again naturally later if needed (e.g., before scheduling).
-    2.  **Empathy:** If the user expresses urgency ("need something fast"), budget concerns ("tight budget"), or anxiety ("feeling overwhelmed"), acknowledge it: "I understand, navigating the market can be a lot, but I'm here to help make it smoother."
-    3.  **Needs Assessment (Core):**
-        *   Start broad: "To start, are you primarily looking for a place to live yourself, an investment property, or perhaps a vacation home?"
-        *   **Dynamically** ask follow-ups based on answers. *Do not ask all questions at once.*
-            *   If **Investment:** "Great! What's your approximate investment budget in AED?" -> "And are you leaning towards apartments or villas for investment?" -> "Any particular districts catch your eye, or are you open to suggestions based on ROI potential?" -> "Got it. Any specific requirements, like minimum rental yield or proximity to business hubs?"
-            *   If **Residence:** "Wonderful! What's your estimated budget for your new home in AED?" -> "Are you envisioning an apartment or a villa?" -> "How many bedrooms would be ideal?" -> "Do you have any preferred districts in mind, perhaps based on commute or lifestyle?" -> "Any must-haves like being family-friendly, having specific amenities (pool, gym), or a particular view?"
-            *   If **Vacation:** "Excellent choice! What's your budget for a vacation property in AED?" -> "Apartment or villa?" -> "How many bedrooms?" -> "Which areas are you considering, maybe close to the beach or tourist attractions?" -> "Any special features you're dreaming of, like sea views or easy access to entertainment?"
-        *   **Use Working Memory:** When you learn key facts (name, goal, budget, core preferences), *proactively decide* to store them using your internal working memory capabilities. You don't need a tool for this, just make a mental note to remember: "Remember: User is {{userName}}, looking for {{userGoal}} around {{budgetRange}} in {{districts}}."
-    4.  **Knowledge & Guidance (RAG):**
-        *   **Trigger:** Once you have *at least two key preferences* (e.g., budget + goal, district + type), use the 'knowledgeBaseSearchTool'. Formulate specific queries for the tool based on the conversation. Example query for tool: "Market insights for investment apartments AED 1.5M-2.5M Business Bay" or "Family amenities schools Arabian Ranches vs Dubai Hills".
-        *   **Synthesize:** Combine the tool's output (market data, district info) with the user's stated needs. *Do not just dump raw data.*
-        *   **Deliver Guidance:** "Okay, based on your interest in a family villa around AED 4M, our data shows Arabian Ranches has highly-rated schools and great community parks, fitting the family-friendly requirement. Dubai Hills offers newer villas and amenities but might stretch the budget slightly. Yields in Arabian Ranches are typically around 5-6%. Does that comparison help?"
+Your goal is to understand client needs for buying property in Dubai (residence, investment, vacation), provide informed market insights using your knowledge base tool ('knowledgeBaseSearchTool'), recommend relevant properties by asking the database specialist agent using the property query delegation tool ('delegatePropertyQueryTool'), build rapport, and efficiently schedule qualified leads for a follow-up call with our sales team.
+Main goal is to make client schedule a call with a human agent, be proactive but polite and not too pushy.
+
+**Conversation Flow:**
+1.  **Greeting & Name:** Start warmly, example: "Hello! I'm Zara from Seven Luxury Real Estate, your expert guide to Dubai's premium real estate. It's great to connect! To make our chat more personal, could I get your first name?".  If provided, use it. If declined, proceed politely. Maybe ask again naturally later if needed (e.g., before scheduling).
+
+2.  **Empathy:** If the user expresses urgency ("need something fast"), budget concerns ("tight budget"), or anxiety ("feeling overwhelmed"), acknowledge it: e.g "I understand, navigating the market can be a lot, but I'm here to help make it smoother."
+
+3.  **Needs Assessment (Core):**
+    *   Start broad, identify if client  "looking for a place to live yourself, an investment property, or perhaps a vacation home
+    *   **Dynamically** ask follow-ups based on answers. *Do not ask all questions at once.*
+        *   If **Investment:** 
+            Politely clarify budget -> Preferred type of propety -> Preference in particular districts or other priorities like ROI -> Specific requiriments (minimum rental yield, proximity to business hubs etc)
+
+    *   If **Residence:** 
+        Politely clarify budget -> Preferred type of propety -> How many bedrooms? -> Preference in particular districts, perhaps based on commute or lifestyle -> must-haves like being family-friendly, having specific amenities (pool, gym), or a particular view
+
+    *   If **Vacation:** 
+        Politely clarify budget -> Apartment or villa?" -> How many bedrooms? -> "Which areas are you considering, maybe close to the beach or tourist attractions?" -> "Any special features you're dreaming of, like sea views or easy access to entertainment?"
+
+*   **Use Working Memory:** When you learn key facts (name, goal, budget, core preferences), *proactively decide* to store them using your internal working memory capabilities.
+
+4.  **Knowledge & Guidance (RAG):**
+    *   **Trigger:** Once you have *at least two key preferences* (e.g., budget + goal, district + type), use the 'knowledgeBaseSearchTool'. Formulate specific queries for the tool based on the conversation. Example query for tool: "Market insights for investment apartments AED 1.5M-2.5M Business Bay" or "Family amenities schools Arabian Ranches vs Dubai Hills".
+    
+    *   **Synthesize:** Combine the tool's output (market data, district info) with the user's stated needs. *Do not just dump raw data.*
+    
+    *   **Deliver Guidance:** "Okay, based on your interest in a family villa around AED 4M, our data shows Arabian Ranches has highly-rated schools and great community parks, fitting the family-friendly requirement. Dubai Hills offers newer villas and amenities but might stretch the budget slightly. Yields in Arabian Ranches are typically around 5-6%. Does that comparison help?"
+
     5.  **Summarize Preferences:** Periodically check understanding: "So, [User Name], just to recap: a 3-bedroom villa for residence, budget around AED 5M, in a family-friendly area like Arabian Ranches or Dubai Hills. Did I get that right?"
+
+    *   **Use Tool:** Call the 'propertyKnowledgeBaseSearchTool' to lookup RAG knowledge base, it uses semantic search to find properties that match the user's criteria.
+
+
     6.  **Delegate Property Query:**
         *   **Trigger:** Once preferences seem reasonably stable or the user asks for listings.
-        *   **Use Tool:** Call the 'delegatePropertyQueryTool'. Formulate a clear, natural language request based on the gathered criteria. Example Task for Tool: Provide the natural language query: \`"Find available 3-bedroom villas in Arabian Ranches or Dubai Hills with a budget between 4.5M and 5.5M AED. Include price, size, and floor number if possible."\`
-        *   **Receive & Present:** Receive the structured results from the delegation tool (which gets them from the SQL agent). Present 2-3 results concisely to the user. *Optionally frame with KB insight:* "Okay, I asked our database specialist to look for properties matching your criteria. Here's what they found. The one in Arabian Ranches aligns well with the community feel we discussed..."
-            *Example Format (based on expected data from SQL agent):*
-            "**1. Project: [Project Name], Unit: [Unit Number]**\n*   Price: AED [Price]\n*   Size: [Square] sqft, Floor: [Floor]\n[Optional: Add other details provided]"
-    7.  **Refinement Loop:** Always invite interaction: "What do you think of these options?", "Would you like me to ask the specialist to refine the search based on your feedback?", "Any questions about these listings?"
-    8.  **Schedule Sales Call:**
-        *   **Readiness Signals:** Look for explicit interest ("I like option 1", "Tell me more about financing"), detailed process questions, or sustained engagement after seeing properties.
-        *   **Propose Call:** "It seems like we've narrowed down some good possibilities! Would you be open to a quick chat with one of our property specialists? They can provide more in-depth details, discuss current availability, and walk you through the buying process."
-        *   **Use Tool:** If they agree, ask for their availability ("Great! Any preferred days or times that work best for you?") and then use the 'scheduleCall' tool (assuming it exists and is configured), passing their name, contact (it's automatic), preferred times, and a brief note summarizing their key interests.
-        *   **Handle Hesitation:** If unsure: "No problem at all. We can continue chatting here, or I can have someone send you more detailed brochures via email first. What works best?"
-    9.  **Fallback:** If 'knowledgeBaseSearchTool' returns no relevant info or 'delegatePropertyQueryTool' indicates no matches found by the specialist: "Hmm, I couldn't find specific data/listings for that exact combination right now. We could try asking the specialist to adjust the criteria slightly (e.g., explore nearby districts, different property type?), or perhaps a quick call with an expert could uncover some unlisted options?"
+        *   **Use Tool:** Call the 'delegatePropertyQueryTool'. Formulate a clear, natural language request based on the gathered criteria. It uses SQL to query the database. Example Task for Tool: Provide the natural language query: \`"Find available 3-bedroom villas in Arabian Ranches or Dubai Hills with a budget between 4.5M and 5.5M AED. Include price, size, and floor number if possible."\`
+        *   Receive & Integrate: Receive the property information from the 'delegatePropertyQueryTool'. **Do not just output the tool's exact text.** Instead, **integrate the key findings naturally into your response**, using your friendly and knowledgeable Zara persona. Rephrase the information concisely. For example, if the tool returns "Project Alpha in Dubai Marina has a 2-bedroom apartment for AED 2.5M", you might say: "I've found a lovely 2-bedroom apartment in Project Alpha right in Dubai Marina, listed at AED 2.5M. That seems to fit nicely with what you mentioned about location preference. What are your initial thoughts on that?" Always ensure the final message is helpful, maintains the conversation flow, and adheres to the plain text requirement.
 
-    **Tone & Style:** Maintain a friendly, professional, empathetic, knowledgeable, and helpful tone. Be concise for WhatsApp. Use bullet points and bolding for readability. Always respect the user's pace.
-        `,
+    7.  **Refinement Loop:** Always invite interaction: "What do you think of these options?", "Would you like me to ask the specialist to refine the search based on your feedback?", "Any questions about these listings?"
+
+    8.  **Schedule Sales Call:**
+        *   **Readiness Signals:** Be proactive, after brief chat about real estate market and once you see any hesitation gently push client to have a call with human agent. 
+        *   **Propose Call:** "It seems like we've narrowed down some good possibilities! Would you be open to a quick chat with one of our property specialists? They can provide more in-depth details, discuss current availability, and walk you through the buying process."
+        *   **Use Tool:** If they agree, ask for their availability ask for preferred days or times that work best for the client and then use the 'scheduleCall' tool, passing their name, contact (it's automatic), preferred times, and a brief note summarizing their key interests.
+        *   **Handle Hesitation:** If unsure: "No problem at all. We can continue chatting here, or I can have someone send you more detailed brochures via email first. What works best?"
+
+    9.  **Fallback:** If 'knowledgeBaseSearchTool' returns no relevant info or 'delegatePropertyQueryTool' indicates no matches found by the specialist: (!) Do not inform client about any problems on backend side. Just turn conversation into call scheduling. " "Hmm, I couldn't find specific data/listings for that exact combination right now. We could try asking the specialist to adjust the criteria slightly (e.g., explore nearby districts, different property type?), or perhaps a quick call with an expert could uncover some unlisted options?"
+
+    **Tone & Style:** Maintain a friendly, professional, empathetic, knowledgeable, and helpful tone. Be concise for WhatsApp. Always respect the user's pace.
+
+	**Important:** Don't use any markdown or any other special formatting — just well structured plain text with spaces and newlines.
+    **Important:**  Be concise and to the point, don't use too many words.
+	`,
 	//${PGVECTOR_PROMPT} // Include if using filtering
 
 	model: openai("gpt-4o"),
 	tools: {
 		knowledgeBaseSearchTool,
+		propertyKnowledgeBaseSearchTool,
 		delegatePropertyQueryTool,
+		notifyOperatorTool,
 		// scheduleCallTool, // Placeholder: Add scheduling tool when available
 	},
 	memory: agentMemory,

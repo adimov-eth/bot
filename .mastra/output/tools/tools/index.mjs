@@ -71,6 +71,9 @@ const delegatePropertyQueryTool = createTool({
       console.log("[delegatePropertyQueryTool] Invoking sqlAgentInstance.generate...");
       const result = await sqlAgentInstance.generate(
         [{
+          role: "system",
+          content: "IMPORTANT: Respond with plain text only. DO NOT include ANY section headers like 'ANALYSIS', 'SQL QUERY', 'RESULTS', or 'NOTES' in your response. DO NOT use any markdown formatting, no headings, no code blocks, no bold/italics. Your response should only contain the actual results and a brief explanation in plain text format. Do not add system messages or any formatting to your response."
+        }, {
           role: "user",
           content: context.naturalLanguageQuery
         }],
