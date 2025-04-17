@@ -139,11 +139,11 @@ export const notifyOperatorTool = createTool({
 		try {
 			// Create a temporary bot instance to send the message
 			// Note: This doesn't start polling, just allows sending.
-			const tempBot = new TelegramBot(botToken);
-			await tempBot.sendMessage(operatorChatId, message);
-			console.log(
-				`[notifyOperatorTool] Notification sent to operator chat ID ${operatorChatId}`,
-			);
+			// const tempBot = new TelegramBot(botToken);
+			// await tempBot.sendMessage(operatorChatId, message);
+			// console.log(
+			// 	`[notifyOperatorTool] Notification sent to operator chat ID ${operatorChatId}`,
+			// );
 			return { success: true, message: "Notification sent successfully." };
 		} catch (error) {
 			const errorMsg = `Failed to send notification: ${error instanceof Error ? error.message : String(error)}`;
