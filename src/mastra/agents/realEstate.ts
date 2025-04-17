@@ -219,7 +219,7 @@ Main goal is to make client schedule a call with a human agent, be proactive but
 	tools: {
 		knowledgeBaseSearchTool,
 		propertyKnowledgeBaseSearchTool,
-		delegatePropertyQueryTool,
+		// delegatePropertyQueryTool,
 		notifyOperatorTool,
 		// scheduleCallTool, // Placeholder: Add scheduling tool when available
 	},

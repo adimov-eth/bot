@@ -188,10 +188,10 @@ export class TelegramIntegration {
 		response = response.trim() || "¯\\_(ツ)_/¯";
 
 		const messages = this.chunkMessage(response);
-		const parse_mode = "Markdown";
+		// const parse_mode = "Markdown";
 		for (const part of messages) {
 			// Send plain text without parse_mode
-			await this.bot.sendMessage(chatId, part, { parse_mode });
+			await this.bot.sendMessage(chatId, part);
 		}
 	}
 }
